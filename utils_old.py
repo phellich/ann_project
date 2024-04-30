@@ -1,279 +1,431 @@
-import PIL
-import io
-from collections import defaultdict
+from collections import defaultdict, deque
+
 import numpy as np
-import matplotlib.pyplot as plt
-
-from RL_algorithms.algorithms import *
+from scipy.special import softmax
 
 
-def play(env, Q):
+def softmax_(env, beta, Q):
     """
-    Utility function to check the correct training of the agent. Shows the path taken by the agent moving in the
-    environment env with a greedy policy based on the Q-values Q
+    Chooses an action using softmax distribution over the available actions
     :param env: environment
-    :param Q: empirical estimates of the Q-values
+    :param beta: scaling parameter of the softmax policy
+    :param Q: current Q-values
     :return:
-        - a sequence of snapshots corresponding to the different agent positions
+        - the chosen action
     """
-    im_vec = []
-    env.reset()
-    # Step 0
-    fig, _ = env.render(show=False)
-    buf = io.BytesIO()
-    fig.savefig(buf)
-    buf.seek(0)
-    im = np.asarray(PIL.Image.open(buf))
-    im_vec.append(im)
-    # Steps 1 to end
-    while not env.end:
-        action = epsilon_greedy(env, 0, Q)
-        env.do_action(action)
-        fig, _ = env.render(show=False)
-        buf = io.BytesIO()
-        fig.savefig(buf)
-        buf.seek(0)
-        im = np.asarray(PIL.Image.open(buf))
-        im_vec.append(im)
+    # get the available positions
+    available_actions = env.available()
 
-    fig = plt.figure(figsize=(10, 7))
-    columns = 4
-    rows = int(np.ceil(len(im_vec)/4))
-    for i, img in enumerate(im_vec):
-        fig.add_subplot(rows, columns, i+1)
-        plt.imshow(img)
-        plt.axis('off')
-        plt.title("Step " + str(i))
-    plt.tight_layout()
-    plt.show()
+    q = np.copy(Q[env.get_state()])
+    # Apply the scaling parameter to the action choices
+    q = beta * q
+    mask = [env.encode_action(action) for action in available_actions]
+    return str(np.random.choice(available_actions, p=softmax(q[mask])))
 
 
-################################# PLOTTING UTILS #################################
-def running_average(stats, key):
+def epsilon_greedy(env, epsilon, Q):
     """
-    Computes the running average of the quantities stored in stats[key]
-    :param stats: statistics collected during training
-    :param key: key
-    :return:
-        - the running average (computed after each item) of stats[key]
-    """
-    return [np.sum(stats[key][:i]) / (i+1) for i in range(len(stats[key]))]
-
-
-def average_stats(stats_dict, num_avg):
-    """
-    Computes average quantities (over num_avg training runs) of statistics
-    :param stats_dict: dictionary of statistics collected during training e.g. for different random seeds
-    :param num_avg: number of averages considered
-    :return:
-        - mean of the quantity of interest over num_avg training runs
-        - standard deviation of the same values
-    """
-    return np.mean([stats_dict[i] for i in range(num_avg)], axis=0), np.std([stats_dict[i] for i in range(num_avg)], axis=0) / np.sqrt(num_avg)
-
-
-def compare_episodes_lengths_and_rewards(env, algos, num_avg, show_std, additional_params=None):
-    """
-    Utility function to compare different algorithms and their performance in terms of average episode length
-    :param additional_params: additional parameters common to all algorithms
+    Chooses an epsilon-greedy action starting from a given state and given Q-values
     :param env: environment
-    :param algos: algorithms to be compared
-    :param num_avg: number of averages to be performed for different random seeds
-    :param show_std: True to show shaded region for the standard deviation in the produced plot
+    :param epsilon: current exploration parameter
+    :param Q: current Q-values.
     :return:
+        - the chosen action
     """
-    # set figure and axes
-    fig, ax = plt.subplots(1, 2, figsize=(14.4, 4.8), squeeze=False)
-    # fig.tight_layout(pad=7.)
-    fig.subplots_adjust(top=0.9, left=0.1, right=1.1, bottom=0.12)  # adjust the spacing between subplots
-    fig.suptitle(f"{env.get_num_states()} states", fontsize=20)
-    if additional_params is None:
-        additional_params = [{}] * len(algos)
-    # loop over the algorithms
-    for ind, algo in enumerate(algos):
-        name = algo["name"]
-        episode_lengths = defaultdict(lambda: {})  # initialize dictionary for current algorithm
-        episode_rewards = defaultdict(lambda: {})
-        algos_params = {'env': env, **algo["params"], **additional_params[ind]}
-        for i in range(num_avg):
-            Q, stats = eval(algo["algo_name"])(**algos_params)  # evaluate algorithm
-            episode_lengths.update({i: stats["episode_lengths"]})  # save stats of current training
-            episode_rewards.update({i: running_average(stats, "episode_rewards")})
-        # compute mean and standard deviation
-        episodes_averages = average_stats(episode_lengths, num_avg)  # compute averages for current algorithm
-        reward_averages = average_stats(episode_rewards, num_avg)  # compute averages for current algorithm
-        ax[0, 0].set_xlabel("Episode", fontsize=15)
-        ax[0, 0].set_ylabel("Average episode length", fontsize=15)
-        if not show_std:
-            ax[0, 0].plot(np.arange(len(episodes_averages[0])), episodes_averages[0], label=f"{name}")
+    # get the available positions
+    available_actions = env.available()
+
+    if np.random.uniform(0, 1) < epsilon:
+        # with probability epsilon make a random move (exploration)
+        return str(np.random.choice(available_actions))
+    else:
+        # with probability 1-epsilon choose the action with the highest immediate reward (exploitation)
+        q = np.copy(Q[env.get_state()])
+        mask = [env.encode_action(action) for action in available_actions]
+        q = [q[i] if i in mask else np.nan for i in range(len(q))]
+        max_indices = np.argwhere(q == np.nanmax(q)).flatten()  # best action(s) along the available ones
+        return env.inverse_encoding(int(np.random.choice(max_indices)))  # ties are split randomly
+
+
+def q_learning(env, alpha=0.05, gamma=0.99, num_episodes=1000, action_policy="epsilon_greedy", epsilon_exploration=0.1,
+               epsilon_exploration_rule=None, trace_decay=0, initial_q=0):
+    """
+    Trains an agent using the Q-Learning algorithm, by playing num_episodes until the end.
+    :param env: the environment
+    :param alpha: learning rate
+    :param gamma: discount rate for future rewards
+    :param num_episodes: number of training episodes
+    :param action_policy: string for the action policy to be followed during training
+        It is usually "epsilon_greedy" or "softmax_"
+    :param trace_decay: trace decay factor for eligibility traces
+        If 0, q_learning(0) is implemented without any eligibility trace. If a non-zero float is given in input
+        the latter represents the trace decay factor and q_learning(lambda) is implemented
+    :param epsilon_exploration: parameter of the exploration policy: exploration rate or softmax_ scaling factor
+        If action_policy is "epsilon_greedy":
+            If epsilon_exploration_rule is None, at each iteration the action with the highest Q-value
+            is taken with probability (1-epsilon_exploration)
+        If action_policy is "softmax_":
+            epsilon_exploration is actually beta, the scaling factor for the softmax.
+    :param epsilon_exploration_rule: function mapping each positive integer to the exploitation epsilon
+        of the corresponding episode.
+        If epsilon_exploration_rule is not None, at episode number n during training the parameter for the 
+        exploration policy is epsilon_exploration_rule(n).
+    :param initial_q: initialization value of all Q-values
+    :return:
+        - Q: empirical estimates of the Q-values
+        - stats: dictionary of statistics collected during training, with keys 'episode_rewards' and 'episode_lengths',
+            and the corresponding values being a list (of length num_episodes) containing, for each episode, the reward
+            collected and the length of the episode respectively.
+    """
+
+    # Q-values map
+    # Dictionary that maps the tuple representation of the state to a dictionary of action values
+    Q = defaultdict(lambda: initial_q * np.ones(env.get_num_actions()))  # All Q-values are initialized to initial_q
+    # Stats of training
+    episode_rewards = np.empty(num_episodes)
+    episode_lengths = np.empty(num_episodes)
+
+    assert action_policy in ("epsilon_greedy", "softmax_")
+    # Set the default value of the exploration parameter
+    if epsilon_exploration is None:
+        if action_policy == "epsilon_greedy":
+            epsilon_exploration = 0.1
         else:
-            ax[0, 0].errorbar(np.arange(len(episodes_averages[0])), episodes_averages[0], episodes_averages[1], label=f"{name}")
-        ax[0, 1].set_xlabel("Episode", fontsize=15)
-        ax[0, 1].set_ylabel("Running average of the reward", fontsize=15)
-        ax[0, 1].set_ylim([1, 2])
-        ax[0, 1].plot(np.arange(len(episodes_averages[0])), reward_averages[0], label=f"{name}")
-        if show_std:
-            ax[0, 1].fill_between(np.arange(additional_params[0]["num_episodes"]),
-                                  reward_averages[0]-reward_averages[1], reward_averages[0]+reward_averages[1], alpha=0.2)
-        # place legend outside plot (below)
-        ax.flatten()[-2].legend(loc='upper center', bbox_to_anchor=(1.1, -0.15), fancybox=True, shadow=True,
-                                ncol=5, fontsize='xx-large')  # unique legend for the two plots
+            epsilon_exploration = 2
+
+    if epsilon_exploration_rule is None:
+        def epsilon_exploration_rule(n):
+            return epsilon_exploration  # if an exploration rule is not given, it is the constant one
+
+    for itr in range(num_episodes):
+        env.reset()
+        length = 0
+        total_reward = 0
+        e = defaultdict(lambda: np.zeros(env.get_num_actions()))  # shadow variable for each state action pair, all to 0
+
+        # first state outside the loop
+        state = env.get_state()
+
+        while not env.end:
+
+            # rescale all traces
+            for key in list(e):
+                e[key] *= trace_decay
+
+            # choose action according to the desired policy
+            action = eval(action_policy)(env, epsilon_exploration_rule(itr + 1), Q)
+            next_state, reward = env.do_action(action)  # Move according to the policy
+
+            length += 1
+            total_reward += reward
+
+            # current state action pair
+            e[state][env.encode_action(action)] += 1
+
+            if not env.end:
+                next_greedy_action = epsilon_greedy(env, 0, Q=Q)
+                target = reward + gamma * Q[next_state][env.encode_action(next_greedy_action)]
+            else:
+                target = reward  # the fictitious Q-value of Q(next_state)[\cdot] is zero
+
+            # update all Q-values
+            for key in list(e):
+                Q[key] += alpha * (target - Q[state][env.encode_action(action)]) * e[key]
+
+            # Preparing for the next move
+            state = next_state
+
+        episode_rewards[itr] = total_reward  # reward of the current episode
+        episode_lengths[itr] = length  # length of the current episode
+    # Dictionary of stats
+    stats = {
+        'episode_rewards': episode_rewards,
+        'episode_lengths': episode_lengths,
+    }
+
+    return Q, stats
 
 
-def compare_length_first_episode(env, algorithms, additional_params, variable_vals, variable_name, num_avg=500):
+def sarsa(env, alpha=0.05, gamma=0.99, num_episodes=1000, action_policy="epsilon_greedy", epsilon_exploration=0.1,
+          epsilon_exploration_rule=None, trace_decay=0, initial_q=0):
     """
-    Utility function to compare the length of the first episode (of pure exploration if initial_q = 0) for different
-    exploration strategy
-    :param env: environment
-    :param algorithms: algorithms to be compared
-    :param additional_params: additional parameters common to all the algorithms
-    :param variable_vals: values of critical variable which is being tested
-    :param variable_name: name of the critical variable
-    :param num_avg: number of averages considered
+    Trains an agent using the Sarsa algorithm, by playing num_episodes until the end.
+    :param env: the environment
+    :param alpha: learning rate
+    :param gamma: discount rate for future rewards
+    :param num_episodes: number of training episodes
+    :param action_policy: string for the action policy to be followed during training
+        It is usually "epsilon_greedy" or "softmax_"
+    :param trace_decay: trace decay factor for eligibility traces
+        If 0, sarsa(0) is implemented without any eligibility trace. If a non-zero float is given in input
+        the latter represents the trace decay factor and sarsa(lambda) is implemented
+    :param epsilon_exploration: parameter of the exploration policy: exploration rate or softmax_ scaling factor
+        If action_policy is "epsilon_greedy":
+            If epsilon_exploration_rule is None, at each iteration the action with the highest Q-value
+            is taken with probability (1-epsilon_exploration)
+        If action_policy is "softmax_":
+            epsilon_exploration is actually beta, the scaling factor for the softmax.
+    :param epsilon_exploration_rule: function mapping each positive integer to the exploitation epsilon
+        of the corresponding episode.
+        If epsilon_exploration_rule is not None, at episode number n during training the action
+        with the highest Q-value is taken with probability (1-epsilon_exploration_rule(n))
+    :param initial_q: initialization value of all Q-values
     :return:
+        - Q: empirical estimates of the Q-values
+        - stats: dictionary of statistics collected during training, with keys 'episode_rewards' and 'episode_lengths',
+            and the corresponding values being a list (of length num_episodes) containing, for each episode, the reward
+            collected and the length of the episode respectively.
     """
-    # Initialize list for storing episode lengths of each algorithm
-    algo_length = []
+    # Q-values map
+    # Dictionary that maps the tuple representation of the state to a dictionary of action values
+    Q = defaultdict(lambda: initial_q * np.ones(env.get_num_actions()))  # All Q-values are initialized to initial_q
+    # Stats of training
+    episode_rewards = np.empty(num_episodes)
+    episode_lengths = np.empty(num_episodes)
 
-    # Loop over algorithms
-    for algo in algorithms:
-        # Print name of the current algorithm
-        print(algo['name'])
-        # Initialize vector to store the episode lengths
-        episode_length = np.zeros((num_avg, len(additional_params)))
-        # Loop over different configurations of the additional params
-        for j in range(len(additional_params)):
-            input_param = {'env': env, **algo['params'], **additional_params[j]}
-            for i in range(num_avg):
-                returns = eval(algo['algo_name'])(**input_param)
-                # Get the training statistics
-                stats = returns[-1]
-                # Append the length of the current episode
-                episode_length[i][j] = stats['episode_lengths'][0]
-        # Append the episode lengths for the current algorithm
-        algo_length.append(episode_length)
+    assert action_policy in ("epsilon_greedy", "softmax_")
 
-    # Show results
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.set_xlabel(variable_name)
-    ax.set_ylabel('Length of the first episode')
+    if epsilon_exploration_rule is None:
+        def epsilon_exploration_rule(n):
+            return epsilon_exploration  # if an exploration rule is not given, it is the constant one
 
-    for a, algo in enumerate(algorithms):
-        episode_length = algo_length[a]
-        it_mean = np.mean(episode_length, axis=0)
-        it_stderr = np.std(episode_length, axis=0) / np.sqrt(num_avg)
-        ax.plot(variable_vals, it_mean, label=algo['name'])
-        ax.fill_between(variable_vals, it_mean + it_stderr, it_mean - it_stderr, color=plt.gca().lines[-1].get_color(),
-                        alpha=0.2)
+    for itr in range(num_episodes):
+        env.reset()
+        length = 0
+        total_reward = 0
+        e = defaultdict(lambda: np.zeros(env.get_num_actions()))  # shadow variable for each state action pair, all to 0
 
-    ax.legend()
-    plt.show()
-    return
+        # first state and action outside the loop
+        state = env.get_state()
+
+        # choose action according to the desired policy
+        action = eval(action_policy)(env, epsilon_exploration_rule(itr + 1), Q=Q)
+
+        while not env.end:
+
+            # rescale all traces
+            for key in list(e):
+                e[key] *= trace_decay
+
+            # Move according to the policy
+            next_state, reward = env.do_action(action)
+            length += 1
+            total_reward += reward
+
+            # current state action pair
+            e[state][env.encode_action(action)] += 1
+
+            if not env.end:
+                # choose action according to the desired policy
+                next_action = eval(action_policy)(env, epsilon_exploration_rule(itr + 1), Q=Q)
+                target = reward + gamma * Q[next_state][env.encode_action(next_action)]
+            else:
+                target = reward  # the fictitious Q-value of Q(next_state)[\cdot] is zero
+
+            # update all Q-values
+            for key in list(e):
+                Q[key] += alpha * (target - Q[state][env.encode_action(action)]) * e[key]
+
+            # Preparing for the next move
+            state = next_state
+
+            if not env.end:
+                action = next_action
+
+        episode_rewards[itr] = total_reward  # reward of the current episode
+        episode_lengths[itr] = length  # length of the current episode
+
+    # Dictionary of stats
+    stats = {
+        'episode_rewards': episode_rewards,
+        'episode_lengths': episode_lengths,
+    }
+
+    return Q, stats
 
 
-def count_direct_paths(env, stats):
+def n_step_sarsa(env, alpha=0.05, gamma=0.99, num_episodes=1000, action_policy="epsilon_greedy", n=1,
+                 epsilon_exploration=0.5, epsilon_exploration_rule=None, initial_q=0):
     """
-    Utility function to compute the cumulative sum of the number of times the agent has reached directly the highest
-    rewarded state from the origin state in the given environment
-    :param env: environment
-    :param stats: stats collected during training
+    Trains an agent using the Sarsa algorithm, by playing num_episodes until the end.
+    :param env: the environment
+    :param alpha: learning rate
+    :param gamma: discount rate for future rewards
+    :param num_episodes: number of training episodes
+    :param action_policy: string for the action policy to be followed during training
+        It is usually "epsilon_greedy" or "softmax_"
+    :param n: for n = 1 standard Sarsa(0) is recovered, otherwise n-step Sarsa is implemented
+    :param epsilon_exploration: parameter of the exploration policy: exploration rate or softmax_ scaling factor
+        If action_policy is "epsilon_greedy":
+            If epsilon_exploration_rule is None, at each iteration the action with the highest Q-value
+            is taken with probability (1-epsilon_exploration)
+        If action_policy is "softmax_":
+            epsilon_exploration is actually beta, the scaling factor for the softmax.
+    :param epsilon_exploration_rule: function mapping each positive integer to the exploitation epsilon
+        of the corresponding episode.
+        If epsilon_exploration_rule is not None, at episode number n during training the action
+        with the highest Q-value is taken with probability (1-epsilon_exploration_rule(n))
+    :param initial_q: initialization value of all Q-values
     :return:
-        - the cumulative sum of a 0-1 array where 0/1 corresponds to not having reached/having reached the goal
-          in the minimum number of steps
+        - Q: empirical estimates of the Q-values
+        - stats: dictionary of statistics collected during training, with keys 'episode_rewards' and 'episode_lengths',
+            and the corresponding values being a list (of length num_episodes) containing, for each episode, the reward
+            collected and the length of the episode respectively.
     """
-    return np.cumsum([1 if stats["episode_rewards"][i] == env.highest_reward() and
-                      stats["episode_lengths"][i] == env.get_direct_path_len()
-                      else 0 for i in range(len(stats["episode_rewards"]))])
+    # Q-values map
+    # Dictionary that maps the tuple representation of the state to a dictionary of action values
+    Q = defaultdict(lambda: initial_q * np.ones(env.get_num_actions()))  # All Q-values are initialized to initial_q
+    # Stats of training
+    episode_rewards = np.empty(num_episodes)
+    episode_lengths = np.empty(num_episodes)
 
+    assert action_policy in ("epsilon_greedy", "softmax_")
 
-def compare_rewards_vs_direct_paths(env, algorithms, additional_params, num_episodes=1000, zoom=False,
-                                    single_plots=False, frac_episodes_zoom=0.1):
+    if epsilon_exploration_rule is None:
+        def epsilon_exploration_rule(n):
+            return epsilon_exploration  # if an exploration rule is not given, it is the constant one
+
+    reward_weights = np.array([gamma ** i for i in range(n)])
+
+    for itr in range(num_episodes):
+        env.reset()
+        length = 0
+        total_reward = 0
+
+        # first state and action outside the loop
+        state = env.get_state()
+
+        current_episode_states_actions = deque(maxlen=n+1)
+        current_episode_rewards = deque(maxlen=n)
+
+        # choose action according to the desired policy
+        action = eval(action_policy)(env, epsilon_exploration_rule(itr + 1), Q=Q)
+        current_episode_states_actions.append((state, action))
+        next_action = None
+
+        while not env.end:
+
+            # Move according to the policy
+            next_state, reward = env.do_action(action)
+            current_episode_rewards.append(reward)
+
+            length += 1
+            total_reward += reward
+
+            if not env.end:
+                next_action = eval(action_policy)(env, epsilon_exploration_rule(itr + 1), Q=Q)
+                current_episode_states_actions.append((next_state, next_action))
+                target = np.dot(np.array(current_episode_rewards), reward_weights[:len(current_episode_rewards)]) + \
+                    gamma ** n * Q[next_state][env.encode_action(next_action)]
+            else:
+                target = np.dot(np.array(current_episode_rewards), reward_weights[:len(current_episode_rewards)])
+
+            if len(current_episode_rewards) == current_episode_rewards.maxlen and not env.end:
+                Q[current_episode_states_actions[0][0]][env.encode_action(current_episode_states_actions[0][1])] += \
+                    alpha * (target - Q[current_episode_states_actions[0][0]][env.encode_action(current_episode_states_actions[0][1])])
+
+            action = next_action
+
+        # update remaining Q-values within n steps from the reward
+        current_episode_states_actions.popleft()
+
+        for i in range(len(current_episode_rewards)):
+            target = np.dot(np.array(current_episode_rewards)[i:], reward_weights[:(len(current_episode_rewards)-i)])
+            current_element = current_episode_states_actions[i]
+            Q[current_element[0]][env.encode_action(current_element[1])] += \
+                alpha * (target - Q[current_element[0]][env.encode_action(current_element[1])])
+
+        episode_rewards[itr] = total_reward  # reward of the current episode
+        episode_lengths[itr] = length  # length of the current episode
+
+    # Dictionary of stats
+    stats = {
+        'episode_rewards': episode_rewards,
+        'episode_lengths': episode_lengths,
+    }
+
+    return Q, stats
+
+####################### NOT USED #######################
+def td(env, alpha=0.05, gamma=0.99, num_episodes=1000, epsilon_exploration=1, action_policy="epsilon_greedy",
+       epsilon_exploration_rule=None, trace_decay=0, initial_v=0):
     """
-    Compares rewards' number with number of direct paths from origin
-    :param env: environment
-    :param algorithms: algorithms to be compared
-    :param additional_params: additional parameters common to all the algorithms
-    :param num_episodes: number of episodes
-    :param zoom: True to do a zoom on the first episodes
-    :param single_plots: True to show also single plots
-    :param frac_episodes_zoom: percentage of the number of episodes to show in zoomed plots
+    Trains an agent using the TD algorithm, by playing num_episodes until the end.
+    :param env: the environment
+    :param alpha: learning rate
+    :param gamma: discount rate for future rewards
+    :param num_episodes: number of training episodes
+    :param action_policy: string for the action policy to be followed during training
+    :param trace_decay: trace decay factor for eligibility traces
+        If 0, TD(0) is implemented without any eligibility trace. If a non-zero float is given in input
+        the latter represents the trace decay factor and TD(lambda) is implemented
+    :param epsilon_exploration: exploration rate of the action_policy
+    :param epsilon_exploration_rule: function mapping each positive integer to the exploitation epsilon
+        of the corresponding episode
+    :param initial_v: initialization value of all V-values
     :return:
+        - V: empirical estimates of the V-values
+        - stats: dictionary of statistics collected during training
     """
-    # Comparing number of direct paths and number of rewards with initialization in origin
-    algo_timing = []
+    # V-values map
+    # Dictionary that maps the tuple representation of the state to a dictionary of state values
+    V = defaultdict(lambda: initial_v)  # All V-values are initialized to initial_v
+    # Stats of training
+    episode_rewards = np.empty(num_episodes)
+    episode_lengths = np.empty(num_episodes)
 
-    for i, algo in enumerate(algorithms):
-        # Evaluate the algorithm
-        input_param = {'env': env, **algo['params'], **additional_params[i], 'num_episodes': num_episodes}
-        returns = eval(algo['algo_name'])(**input_param)
-        # Get the stats
-        stats = returns[-1]
-        episode_lengths = [0, *stats['episode_lengths']]
-        # Compute the episode at which each reward is obtained
-        reward_time = np.cumsum(episode_lengths)
-        # Compute the cumulative reward
-        rewards = np.arange(len(reward_time))
-        # Compute the number of direct paths
-        direct_paths = [item[0] == env.direct_path_len() and item[1] == env.highest_reward() for item in
-                        list(zip(episode_lengths, [0, *stats["episode_rewards"]]))]
-        direct_paths_sum = np.cumsum(direct_paths)
-        # Store the computations
-        algo_timing.append({'reward_time': reward_time, 'rewards': rewards, 'direct_paths': direct_paths_sum})
+    assert action_policy in ("epsilon_greedy", "softmax_")
 
-    # Prepare the plots
-    fig, ax = plt.subplots(figsize=(8, 5))
-    if single_plots:
-        fig_paths, ax_paths = plt.subplots(figsize=(8, 5))
-    if zoom:
-        fig_zoom, ax_zoom = plt.subplots(figsize=(8, 5))
-        ax_zoom.set_xlabel('Time (steps)')
-        ax2_zoom = ax_zoom.twinx()
-        ax_zoom.set_ylabel('Cumulative rewards (-)')
-        ax2_zoom.set_ylabel('Number of direct paths from origin (- -)')
-        fig_paths_zoom, ax_paths_zoom = plt.subplots(figsize=(8, 5))
-        ax_paths_zoom.set_xlabel('Episodes')
-        ax_paths_zoom.set_ylabel('Number of direct paths from origin')
+    if epsilon_exploration_rule is None:
+        def epsilon_exploration_rule(n):
+            return epsilon_exploration  # if an exploration rule is not given, it is the constant one
 
-    # Show results
-    ax.set_xlabel('Time (steps)')
-    ax2 = ax.twinx()
-    ax.set_ylabel('Number of rewards (-)')
-    ax2.set_ylabel('Number of direct paths from origin (- -)')
+    for itr in range(num_episodes):
+        env.reset()
+        length = 0
+        e = defaultdict(lambda: 0)  # shadow variable for each state action pair, all to 0
 
-    idx = int(num_episodes * frac_episodes_zoom)
+        # first state and action outside the loop
+        state = env.get_state()
+        e[state] = 1
+        action = eval(action_policy)(env, epsilon_exploration_rule(itr + 1), Q=None)
+        reward = 0
+        while not env.end:
 
-    if single_plots:
-        ax_paths.set_xlabel('Episodes')
-        ax_paths.set_ylabel('Number of direct paths from origin')
+            # rescale all traces
+            for key in list(e):
+                e[key] *= trace_decay
 
-    idx = int(num_episodes * frac_episodes_zoom)
+            # Move according to the policy
+            next_state, reward = env.do_action(action)
+            length += 1
 
-    for a, algo in enumerate(algorithms):
-        reward_time = algo_timing[a]['reward_time']
-        rewards = algo_timing[a]['rewards']
-        direct_paths = algo_timing[a]['direct_paths']
-        color = next(ax._get_lines.prop_cycler)['color']
-        
-        # Whole training
-        # Independent variable: time steps
-        ax.plot(reward_time, rewards, '-', label=algo['name'], color=color)
-        ax2.plot(reward_time, direct_paths, '--', color=color)
-        # Independent variable: episodes
-        if single_plots:
-            ax_paths.plot(np.arange(len(direct_paths))+1, direct_paths, '-', label=algo['name'], color=color)
-        
-        # Zoom in
-        if zoom:
-            ax_zoom.plot(reward_time[:idx], rewards[:idx], '-', label=algo['name'], color=color)
-            ax2_zoom.plot(reward_time[:idx], direct_paths[:idx], '--', color=color)
-            # Independent variable: episodes
-            ax_paths_zoom.plot(np.arange(len(direct_paths[:idx]))+1, direct_paths[:idx], '-', label=algo['name'], color=color)
-            ax_paths_zoom.legend()
+            # current state action pair
+            e[state] += 1
 
-    ax.legend()
-    if single_plots:
-        ax_paths.legend()
-    if zoom:
-        ax_zoom.legend()
-        ax_paths_zoom.legend()
-    plt.show()
+            if not env.end:
+                next_action = eval(action_policy)(env, epsilon_exploration_rule(itr + 1), Q=None)
+                target = reward + gamma * V[next_state]
+            else:
+                target = reward  # the fictitious V-value of V(next_state) is zero
+
+            # update all V-values
+            for key in list(e):
+                V[key] += alpha * (target - V[state]) * e[key]
+
+            # Preparing for the next move
+            state = next_state
+
+            if not env.end:
+                action = next_action
+
+        episode_rewards[itr] = reward  # reward of the current episode
+        episode_lengths[itr] = length  # length of the current episode
+
+    # Dictionary of stats
+    stats = {
+        'episode_rewards': episode_rewards,
+        'episode_lengths': episode_lengths,
+    }
+
+    return V, stats
