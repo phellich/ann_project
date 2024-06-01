@@ -21,7 +21,7 @@ class DynaAgent:
         
         self.gamma = 0.99
         self.epsilon = 0.9 # exponential decay until 0.05
-        self. k = 3
+        self.k = 3
         
         self.P = np.zeros((self.n_states, self.n_actions, self.n_states))
         self.R = np.zeros((self.n_states, self.n_actions))
