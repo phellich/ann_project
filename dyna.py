@@ -175,14 +175,3 @@ def plot_qvalues(model_path, dyna, ax=None):
     ax.set_ylabel('Velocity')
     plt.title('Learned Q-values')
     return ax
-
-    # Heatmap of Q-values
-    # fig, ax = plt.subplots(figsize=(10, 6))
-    # plt.imshow(Z, extent=(min(dyna.positions), max(dyna.positions), 
-                      # min(dyna.velocities), max(dyna.velocities)), 
-                    # aspect='auto', origin='lower', interpolation='bicubic')
-    # plt.colorbar()
-    # ax.set_xlabel('Position')
-    # ax.set_ylabel('Velocity')
-    # plt.show()
-
